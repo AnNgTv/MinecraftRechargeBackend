@@ -1,0 +1,10 @@
+node_modules
+.env
+recharges.json
+history.json
+backend.log
+tunnel_*.log
+*.log
+rcon_test.js
+update_tunnel.js
+system_startup.log
