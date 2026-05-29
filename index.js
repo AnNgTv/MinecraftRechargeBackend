@@ -115,6 +115,15 @@ app.post('/api/callback', async (req, res) => {
     res.send('OK');
 });
 
+app.get('/api/test-rcon', async (req, res) => {
+    try {
+        const response = await executeMcCommand('say RCON Test Connection Success!');
+        res.json({ status: 'success', server_response: response });
+    } catch (err) {
+        res.status(500).json({ status: 'error', message: err.message });
+    }
+});
+
 app.get('/api/top-recharge', (req, res) => {
     const data = JSON.parse(fs.readFileSync(DATABASE_FILE));
     res.json(data.slice(0, 10));
