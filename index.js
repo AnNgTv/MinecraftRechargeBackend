@@ -40,38 +40,66 @@ const authenticateToken = (req, res, next) => {
     });
 };
 
-// 1. API Đăng ký
+// Hàm lưu lịch sử nạp (Local JSON)
+function saveRechargeLocal(username, amount) {
+    const data = JSON.parse(fs.readFileSync(DATABASE_FILE));
+    const userIndex = data.findIndex(item => item.username.toLowerCase() === username.toLowerCase());
+    if (userIndex !== -1) {
+        data[userIndex].total += parseInt(amount);
+    } else {
+        data.push({ username, total: parseInt(amount), lastUpdate: new Date() });
+    }
+    data.sort((a, b) => b.total - a.total);
+    fs.writeFileSync(DATABASE_FILE, JSON.stringify(data, null, 2));
+
+    const history = JSON.parse(fs.readFileSync(HISTORY_FILE));
+    history.unshift({ username, amount: parseInt(amount), date: new Date() });
+    if (history.length > 50) history.pop(); // Tăng lên 50 bản ghi
+    fs.writeFileSync(HISTORY_FILE, JSON.stringify(history, null, 2));
+}
+
+// Hàm gửi lệnh đến Minecraft Server qua RCON
+async function executeMcCommand(command) {
+    try {
+        const rcon = await Rcon.connect({
+            host: process.env.RCON_HOST,
+            port: parseInt(process.env.RCON_PORT),
+            password: process.env.RCON_PASSWORD,
+        });
+        const response = await rcon.send(command);
+        await rcon.end();
+        return response;
+    } catch (err) {
+        console.error('RCON Error:', err);
+        throw err;
+    }
+}
+
+// --- API AUTH ---
+
 app.post('/api/auth/register', async (req, res) => {
     const { username, password } = req.body;
     const users = JSON.parse(fs.readFileSync(USERS_FILE));
-
     if (users.find(u => u.username.toLowerCase() === username.toLowerCase())) {
         return res.status(400).json({ message: 'Tên tài khoản đã tồn tại' });
     }
-
     const hashedPassword = await bcrypt.hash(password, 10);
-    const newUser = { username, password: hashedPassword, createdAt: new Date() };
-    users.push(newUser);
+    users.push({ username, password: hashedPassword, createdAt: new Date() });
     fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2));
-
     res.json({ status: 'success', message: 'Đăng ký thành công!' });
 });
 
-// 2. API Đăng nhập
 app.post('/api/auth/login', async (req, res) => {
     const { username, password } = req.body;
     const users = JSON.parse(fs.readFileSync(USERS_FILE));
     const user = users.find(u => u.username.toLowerCase() === username.toLowerCase());
-
     if (!user || !(await bcrypt.compare(password, user.password))) {
         return res.status(400).json({ message: 'Sai tài khoản hoặc mật khẩu' });
     }
-
     const token = jwt.sign({ username: user.username }, JWT_SECRET, { expiresIn: '7d' });
     res.json({ status: 'success', token, username: user.username });
 });
 
-// 3. API Lấy thông tin cá nhân (Profile)
 app.get('/api/auth/me', authenticateToken, async (req, res) => {
     const username = req.user.username;
     try {
@@ -96,48 +124,18 @@ app.get('/api/auth/me', authenticateToken, async (req, res) => {
     }
 });
 
-app.get('/api/player/:username', async (req, res) => {
-function saveRechargeLocal(username, amount) {
-    const data = JSON.parse(fs.readFileSync(DATABASE_FILE));
-    const userIndex = data.findIndex(item => item.username === username);
-    if (userIndex !== -1) {
-        data[userIndex].total += parseInt(amount);
-    } else {
-        data.push({ username, total: parseInt(amount), lastUpdate: new Date() });
-    }
-    data.sort((a, b) => b.total - a.total);
-    fs.writeFileSync(DATABASE_FILE, JSON.stringify(data, null, 2));
-
+// Lấy lịch sử nạp cá nhân
+app.get('/api/auth/transactions', authenticateToken, (req, res) => {
+    const username = req.user.username;
     const history = JSON.parse(fs.readFileSync(HISTORY_FILE));
-    history.unshift({ username, amount: parseInt(amount), date: new Date() });
-    if (history.length > 20) history.pop();
-    fs.writeFileSync(HISTORY_FILE, JSON.stringify(history, null, 2));
-}
+    const userHistory = history.filter(h => h.username.toLowerCase() === username.toLowerCase());
+    res.json({ status: 'success', transactions: userHistory });
+});
 
-// Hàm gửi lệnh đến Minecraft Server qua RCON
-async function executeMcCommand(command) {
-    try {
-        const rcon = await Rcon.connect({
-            host: process.env.RCON_HOST,
-            port: parseInt(process.env.RCON_PORT),
-            password: process.env.RCON_PASSWORD,
-        });
-        console.log('RCON Connected!');
-        const response = await rcon.send(command);
-        console.log('RCON Response:', response);
-        await rcon.end();
-        return response;
-    } catch (err) {
-        console.error('RCON Error:', err);
-        throw err;
-    }
-}
+// --- API RECHARGE ---
 
-// 1. Endpoint nhận thẻ từ Website
 app.post('/api/card-recharge', async (req, res) => {
     const { user, type, amount, code, seri } = req.body;
-    console.log(`Received recharge request for user: ${user} | Card: ${type} | Amount: ${amount}`);
-
     try {
         const response = await axios.get('https://thesieutoc.vn/card-recharge/api', {
             params: {
@@ -149,7 +147,6 @@ app.post('/api/card-recharge', async (req, res) => {
                 request_id: `${user}_${Date.now()}`
             }
         });
-
         const data = response.data;
         if (data.status === '00' || data.status === 'success') {
             res.json({ status: 'success', message: 'Thẻ đã được gửi. Đang chờ xử lý.' });
@@ -157,17 +154,12 @@ app.post('/api/card-recharge', async (req, res) => {
             res.json({ status: 'error', message: data.msg || 'Lỗi hệ thống gạch thẻ.' });
         }
     } catch (error) {
-        console.error('API Error:', error.message);
         res.status(500).json({ status: 'error', message: 'Lỗi kết nối gạch thẻ.' });
     }
 });
 
-// 2. Endpoint CALLBACK
 app.post('/api/callback', async (req, res) => {
-    if (req.query.token !== process.env.CALLBACK_TOKEN) {
-        return res.status(403).send('Sai mã bảo mật');
-    }
-
+    if (req.query.token !== process.env.CALLBACK_TOKEN) return res.status(403).send('Sai mã bảo mật');
     const { status, request_id, amount } = req.body;
     const username = request_id.split('_')[0];
 
@@ -175,52 +167,35 @@ app.post('/api/callback', async (req, res) => {
         try {
             saveRechargeLocal(username, amount);
             const gameAmount = parseInt(amount);
-
-            // Gửi lệnh qua RCON
             await executeMcCommand(`points give ${username} ${gameAmount}`);
             await executeMcCommand(`broadcast §6§l[ ★ NẠP THẺ ★ ] §fNgười chơi §b${username} §fvừa nạp thành công §a${amount.toLocaleString()}đ §fvào hệ thống!`);
             await executeMcCommand(`title ${username} title {"text":"§a§lTHANKS FOR DONATING!"}`);
             await executeMcCommand(`title ${username} subtitle {"text":"§fBạn đã nhận được §e${gameAmount.toLocaleString()} points"}`);
-            
-            console.log(`Successfully executed RCON commands for ${username}`);
         } catch (err) {
-            console.error('Callback Processing Error:', err);
+            console.error('Callback Error:', err);
         }
     }
     res.send('OK');
 });
 
+// --- API PUBLIC ---
+
 app.get('/api/player/:username', async (req, res) => {
     const { username } = req.params;
     try {
-        // 1. Lấy thông tin từ file recharges.json
         const data = JSON.parse(fs.readFileSync(DATABASE_FILE));
         const userData = data.find(item => item.username.toLowerCase() === username.toLowerCase());
         const totalRecharge = userData ? userData.total : 0;
-
-        // 2. Lấy Points từ game qua RCON
         const pointsRes = await executeMcCommand(`points look ${username}`);
-        // Parsing "DuongLegend2 has 100 points."
         const pointsMatch = pointsRes.match(/has ([\d,.]+) points/);
         const points = pointsMatch ? pointsMatch[1] : "0";
-
-        // 3. Lấy Rank từ game qua RCON (Giả sử dùng LuckPerms)
         const rankRes = await executeMcCommand(`lp user ${username} info`);
         const rankMatch = rankRes.match(/Primary group: ([\w-]+)/);
         const rank = rankMatch ? rankMatch[1] : "Default";
 
-        res.json({
-            status: 'success',
-            data: {
-                username,
-                points,
-                rank,
-                totalRecharge
-            }
-        });
+        res.json({ status: 'success', data: { username, points, rank, totalRecharge } });
     } catch (err) {
-        console.error('Player Info Error:', err);
-        res.status(500).json({ status: 'error', message: 'Không tìm thấy thông tin hoặc server offline.' });
+        res.status(500).json({ status: 'error', message: 'Lỗi tra cứu.' });
     }
 });
 
@@ -244,5 +219,5 @@ app.get('/api/recent-recharge', (req, res) => {
 });
 
 app.listen(PORT, () => {
-    console.log(`Backend server with RCON running on port ${PORT}`);
+    console.log(`Backend server running on port ${PORT}`);
 });
