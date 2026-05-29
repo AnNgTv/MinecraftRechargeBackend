@@ -10,6 +10,8 @@ const path = require('path');
 
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const mysql = require('mysql2/promise');
+const crypto = require('crypto');
 
 const app = express();
 app.use(cors());
@@ -19,13 +21,50 @@ app.use(bodyParser.urlencoded({ extended: true }));
 const PORT = process.env.PORT || 3000;
 const DATABASE_FILE = path.join(__dirname, 'recharges.json');
 const HISTORY_FILE = path.join(__dirname, 'history.json');
-const USERS_FILE = path.join(__dirname, 'users.json');
 const JWT_SECRET = process.env.JWT_SECRET || 'nightmare_secret_key_2026';
+
+// Cấu hình MySQL (AuthMe)
+const dbConfig = {
+    host: process.env.DB_HOST || '127.0.0.1',
+    port: parseInt(process.env.DB_PORT || '3306'),
+    user: process.env.DB_USER || 'authme',
+    password: process.env.DB_PASS || '12345',
+    database: process.env.DB_NAME || 'authme'
+};
+
+const pool = mysql.createPool(dbConfig);
+
+// Helper check password AuthMe ($SHA$salt$hash)
+function verifyAuthMePassword(password, storedHash) {
+    if (!storedHash) return false;
+    const parts = storedHash.split('$');
+    if (parts.length === 4 && parts[1] === 'SHA') {
+        const salt = parts[2];
+        const hash = parts[3];
+        const computedHash = crypto.createHash('sha256').update(
+            crypto.createHash('sha256').update(password).digest('hex') + salt
+        ).digest('hex');
+        return computedHash === hash;
+    }
+    // Hỗ trợ BCrypt nếu AuthMe cấu hình BCrypt
+    if (storedHash.startsWith('$2a$') || storedHash.startsWith('$2b$')) {
+        return bcrypt.compareSync(password, storedHash);
+    }
+    return false;
+}
+
+// Helper tạo hash AuthMe ($SHA$salt$hash)
+function hashAuthMePassword(password) {
+    const salt = crypto.randomBytes(8).toString('hex');
+    const hash = crypto.createHash('sha256').update(
+        crypto.createHash('sha256').update(password).digest('hex') + salt
+    ).digest('hex');
+    return `$SHA$${salt}$${hash}`;
+}
 
 // Khởi tạo file dữ liệu nếu chưa có
 if (!fs.existsSync(DATABASE_FILE)) fs.writeFileSync(DATABASE_FILE, JSON.stringify([]));
 if (!fs.existsSync(HISTORY_FILE)) fs.writeFileSync(HISTORY_FILE, JSON.stringify([]));
-if (!fs.existsSync(USERS_FILE)) fs.writeFileSync(USERS_FILE, JSON.stringify([]));
 
 // Middleware kiểm tra Token
 const authenticateToken = (req, res, next) => {
@@ -79,25 +118,46 @@ async function executeMcCommand(command) {
 
 app.post('/api/auth/register', async (req, res) => {
     const { username, password } = req.body;
-    const users = JSON.parse(fs.readFileSync(USERS_FILE));
-    if (users.find(u => u.username.toLowerCase() === username.toLowerCase())) {
-        return res.status(400).json({ message: 'Tên tài khoản đã tồn tại' });
+    try {
+        const [rows] = await pool.execute('SELECT id FROM authme WHERE username = ?', [username]);
+        if (rows.length > 0) {
+            return res.status(400).json({ message: 'Tên tài khoản đã tồn tại trên Server' });
+        }
+        
+        const hashedPassword = hashAuthMePassword(password);
+        const ip = req.ip || '127.0.0.1';
+        
+        await pool.execute(
+            'INSERT INTO authme (username, realname, password, ip, regdate, regip) VALUES (?, ?, ?, ?, ?, ?)',
+            [username.toLowerCase(), username, hashedPassword, ip, Date.now(), ip]
+        );
+        
+        res.json({ status: 'success', message: 'Đăng ký thành công! Bạn có thể dùng tài khoản này vào Server.' });
+    } catch (err) {
+        console.error('Register Error:', err);
+        res.status(500).json({ message: 'Lỗi hệ thống database' });
     }
-    const hashedPassword = await bcrypt.hash(password, 10);
-    users.push({ username, password: hashedPassword, createdAt: new Date() });
-    fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2));
-    res.json({ status: 'success', message: 'Đăng ký thành công!' });
 });
 
 app.post('/api/auth/login', async (req, res) => {
     const { username, password } = req.body;
-    const users = JSON.parse(fs.readFileSync(USERS_FILE));
-    const user = users.find(u => u.username.toLowerCase() === username.toLowerCase());
-    if (!user || !(await bcrypt.compare(password, user.password))) {
-        return res.status(400).json({ message: 'Sai tài khoản hoặc mật khẩu' });
+    try {
+        const [rows] = await pool.execute('SELECT password, username FROM authme WHERE username = ?', [username]);
+        if (rows.length === 0) {
+            return res.status(400).json({ message: 'Tài khoản không tồn tại trên Server' });
+        }
+        
+        const user = rows[0];
+        if (!verifyAuthMePassword(password, user.password)) {
+            return res.status(400).json({ message: 'Sai mật khẩu' });
+        }
+        
+        const token = jwt.sign({ username: user.username }, JWT_SECRET, { expiresIn: '7d' });
+        res.json({ status: 'success', token, username: user.username });
+    } catch (err) {
+        console.error('Login Error:', err);
+        res.status(500).json({ message: 'Lỗi hệ thống database' });
     }
-    const token = jwt.sign({ username: user.username }, JWT_SECRET, { expiresIn: '7d' });
-    res.json({ status: 'success', token, username: user.username });
 });
 
 app.get('/api/auth/me', authenticateToken, async (req, res) => {
