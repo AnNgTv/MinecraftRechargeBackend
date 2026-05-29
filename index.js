@@ -102,10 +102,10 @@ app.post('/api/callback', async (req, res) => {
             const gameAmount = parseInt(amount);
 
             // Gửi lệnh qua RCON
-            await executeMcCommand(`eco give ${username} ${gameAmount}`);
-            await executeMcCommand(`bc §6§l[ ★ NẠP THẺ ★ ] §fNgười chơi §b${username} §fvừa nạp thành công §a${amount.toLocaleString()}đ §fvào hệ thống!`);
+            await executeMcCommand(`points give ${username} ${gameAmount}`);
+            await executeMcCommand(`broadcast §6§l[ ★ NẠP THẺ ★ ] §fNgười chơi §b${username} §fvừa nạp thành công §a${amount.toLocaleString()}đ §fvào hệ thống!`);
             await executeMcCommand(`title ${username} title {"text":"§a§lTHANKS FOR DONATING!"}`);
-            await executeMcCommand(`title ${username} subtitle {"text":"§fBạn đã nhận được §e${gameAmount.toLocaleString()} xu"}`);
+            await executeMcCommand(`title ${username} subtitle {"text":"§fBạn đã nhận được §e${gameAmount.toLocaleString()} points"}`);
             
             console.log(`Successfully executed RCON commands for ${username}`);
         } catch (err) {
