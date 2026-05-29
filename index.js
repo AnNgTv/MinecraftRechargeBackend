@@ -115,6 +115,40 @@ app.post('/api/callback', async (req, res) => {
     res.send('OK');
 });
 
+app.get('/api/player/:username', async (req, res) => {
+    const { username } = req.params;
+    try {
+        // 1. Lấy thông tin từ file recharges.json
+        const data = JSON.parse(fs.readFileSync(DATABASE_FILE));
+        const userData = data.find(item => item.username.toLowerCase() === username.toLowerCase());
+        const totalRecharge = userData ? userData.total : 0;
+
+        // 2. Lấy Points từ game qua RCON
+        const pointsRes = await executeMcCommand(`points look ${username}`);
+        // Parsing "DuongLegend2 has 100 points."
+        const pointsMatch = pointsRes.match(/has ([\d,.]+) points/);
+        const points = pointsMatch ? pointsMatch[1] : "0";
+
+        // 3. Lấy Rank từ game qua RCON (Giả sử dùng LuckPerms)
+        const rankRes = await executeMcCommand(`lp user ${username} info`);
+        const rankMatch = rankRes.match(/Primary group: ([\w-]+)/);
+        const rank = rankMatch ? rankMatch[1] : "Default";
+
+        res.json({
+            status: 'success',
+            data: {
+                username,
+                points,
+                rank,
+                totalRecharge
+            }
+        });
+    } catch (err) {
+        console.error('Player Info Error:', err);
+        res.status(500).json({ status: 'error', message: 'Không tìm thấy thông tin hoặc server offline.' });
+    }
+});
+
 app.get('/api/test-rcon', async (req, res) => {
     try {
         const response = await executeMcCommand('say RCON Test Connection Success!');
