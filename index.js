@@ -8,6 +8,9 @@ const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
 
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+
 const app = express();
 app.use(cors());
 app.use(bodyParser.json());
@@ -16,12 +19,84 @@ app.use(bodyParser.urlencoded({ extended: true }));
 const PORT = process.env.PORT || 3000;
 const DATABASE_FILE = path.join(__dirname, 'recharges.json');
 const HISTORY_FILE = path.join(__dirname, 'history.json');
+const USERS_FILE = path.join(__dirname, 'users.json');
+const JWT_SECRET = process.env.JWT_SECRET || 'nightmare_secret_key_2026';
 
 // Khởi tạo file dữ liệu nếu chưa có
 if (!fs.existsSync(DATABASE_FILE)) fs.writeFileSync(DATABASE_FILE, JSON.stringify([]));
 if (!fs.existsSync(HISTORY_FILE)) fs.writeFileSync(HISTORY_FILE, JSON.stringify([]));
+if (!fs.existsSync(USERS_FILE)) fs.writeFileSync(USERS_FILE, JSON.stringify([]));
 
-// Hàm lưu lịch sử nạp (Local JSON)
+// Middleware kiểm tra Token
+const authenticateToken = (req, res, next) => {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+    if (!token) return res.status(401).json({ message: 'Bạn chưa đăng nhập' });
+
+    jwt.verify(token, JWT_SECRET, (err, user) => {
+        if (err) return res.status(403).json({ message: 'Phiên đăng nhập hết hạn' });
+        req.user = user;
+        next();
+    });
+};
+
+// 1. API Đăng ký
+app.post('/api/auth/register', async (req, res) => {
+    const { username, password } = req.body;
+    const users = JSON.parse(fs.readFileSync(USERS_FILE));
+
+    if (users.find(u => u.username.toLowerCase() === username.toLowerCase())) {
+        return res.status(400).json({ message: 'Tên tài khoản đã tồn tại' });
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 10);
+    const newUser = { username, password: hashedPassword, createdAt: new Date() };
+    users.push(newUser);
+    fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2));
+
+    res.json({ status: 'success', message: 'Đăng ký thành công!' });
+});
+
+// 2. API Đăng nhập
+app.post('/api/auth/login', async (req, res) => {
+    const { username, password } = req.body;
+    const users = JSON.parse(fs.readFileSync(USERS_FILE));
+    const user = users.find(u => u.username.toLowerCase() === username.toLowerCase());
+
+    if (!user || !(await bcrypt.compare(password, user.password))) {
+        return res.status(400).json({ message: 'Sai tài khoản hoặc mật khẩu' });
+    }
+
+    const token = jwt.sign({ username: user.username }, JWT_SECRET, { expiresIn: '7d' });
+    res.json({ status: 'success', token, username: user.username });
+});
+
+// 3. API Lấy thông tin cá nhân (Profile)
+app.get('/api/auth/me', authenticateToken, async (req, res) => {
+    const username = req.user.username;
+    try {
+        const data = JSON.parse(fs.readFileSync(DATABASE_FILE));
+        const userData = data.find(item => item.username.toLowerCase() === username.toLowerCase());
+        const totalRecharge = userData ? userData.total : 0;
+
+        const pointsRes = await executeMcCommand(`points look ${username}`);
+        const pointsMatch = pointsRes.match(/has ([\d,.]+) points/);
+        const points = pointsMatch ? pointsMatch[1] : "0";
+
+        const rankRes = await executeMcCommand(`lp user ${username} info`);
+        const rankMatch = rankRes.match(/Primary group: ([\w-]+)/);
+        const rank = rankMatch ? rankMatch[1] : "Default";
+
+        res.json({
+            status: 'success',
+            user: { username, points, rank, totalRecharge }
+        });
+    } catch (err) {
+        res.json({ status: 'success', user: { username, points: '?', rank: '?', totalRecharge: 0 } });
+    }
+});
+
+app.get('/api/player/:username', async (req, res) => {
 function saveRechargeLocal(username, amount) {
     const data = JSON.parse(fs.readFileSync(DATABASE_FILE));
     const userIndex = data.findIndex(item => item.username === username);
