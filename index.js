@@ -21,6 +21,7 @@ app.use(bodyParser.urlencoded({ extended: true }));
 const PORT = process.env.PORT || 3000;
 const DATABASE_FILE = path.join(__dirname, 'recharges.json');
 const HISTORY_FILE = path.join(__dirname, 'history.json');
+const RECHARGE_TX_FILE = path.join(__dirname, 'recharge-transactions.json');
 const JWT_SECRET = process.env.JWT_SECRET || 'nightmare_secret_key_2026';
 
 // Cấu hình MySQL (AuthMe)
@@ -65,6 +66,7 @@ function hashAuthMePassword(password) {
 // Khởi tạo file dữ liệu nếu chưa có
 if (!fs.existsSync(DATABASE_FILE)) fs.writeFileSync(DATABASE_FILE, JSON.stringify([]));
 if (!fs.existsSync(HISTORY_FILE)) fs.writeFileSync(HISTORY_FILE, JSON.stringify([]));
+if (!fs.existsSync(RECHARGE_TX_FILE)) fs.writeFileSync(RECHARGE_TX_FILE, JSON.stringify({}));
 
 // Middleware kiểm tra Token
 const authenticateToken = (req, res, next) => {
@@ -194,48 +196,148 @@ app.get('/api/auth/transactions', authenticateToken, (req, res) => {
 
 // --- API RECHARGE ---
 
+// Helpers for card-recharge transactions. Keep transaction records separate from display history.
+function readRechargeTransactions() {
+    return JSON.parse(fs.readFileSync(RECHARGE_TX_FILE, 'utf8'));
+}
+function writeRechargeTransactions(data) {
+    fs.writeFileSync(RECHARGE_TX_FILE, JSON.stringify(data, null, 2));
+}
+function safeEqualHex(a, b) {
+    if (typeof a !== 'string' || typeof b !== 'string' || !/^[a-f0-9]{32}$/i.test(a) || !/^[a-f0-9]{32}$/i.test(b)) return false;
+    const aa = Buffer.from(a, 'hex');
+    const bb = Buffer.from(b, 'hex');
+    return aa.length === bb.length && crypto.timingSafeEqual(aa, bb);
+}
+function validMinecraftUsername(username) {
+    return typeof username === 'string' && /^[A-Za-z0-9_]{3,16}$/.test(username);
+}
+function positiveInteger(value) {
+    const n = Number(value);
+    return Number.isSafeInteger(n) && n > 0 ? n : null;
+}
+
 app.post('/api/card-recharge', async (req, res) => {
-    const { user, type, amount, code, seri } = req.body;
+    const { user, type, amount, code, seri } = req.body || {};
+    const partnerId = process.env.THECAOSIEUTOC_PARTNER_ID;
+    const partnerKey = process.env.THECAOSIEUTOC_PARTNER_KEY;
+    const telco = typeof type === 'string' ? type.trim().toUpperCase() : '';
+    const denomination = positiveInteger(amount);
+
+    if (!partnerId || !partnerKey) return res.status(503).json({ status: 'error', message: 'Hệ thống nạp thẻ chưa được cấu hình.' });
+    if (!validMinecraftUsername(user) || !telco || typeof code !== 'string' || typeof seri !== 'string' || !code.trim() || !seri.trim() || !denomination) {
+        return res.status(400).json({ status: 'error', message: 'Thông tin thẻ hoặc tên người chơi không hợp lệ.' });
+    }
+
+    const requestId = `nmtcyt_${Date.now()}_${crypto.randomBytes(6).toString('hex')}`;
+    const sign = crypto.createHash('md5').update(partnerKey + code.trim() + seri.trim()).digest('hex');
+    const txs = readRechargeTransactions();
+    txs[requestId] = {
+        request_id: requestId,
+        username: user,
+        telco,
+        requested_value: denomination,
+        status: 'submitting',
+        created_at: new Date().toISOString()
+    };
+    writeRechargeTransactions(txs);
+
     try {
-        const response = await axios.get('https://thesieutoc.vn/card-recharge/api', {
-            params: {
-                api_key: process.env.THESIEUTOC_API_KEY,
-                pin: code,
-                seri: seri,
-                type: type.toUpperCase(),
-                amount: amount,
-                request_id: `${user}_${Date.now()}`
-            }
-        });
-        const data = response.data;
-        if (data.status === '00' || data.status === 'success') {
-            res.json({ status: 'success', message: 'Thẻ đã được gửi. Đang chờ xử lý.' });
-        } else {
-            res.json({ status: 'error', message: data.msg || 'Lỗi hệ thống gạch thẻ.' });
+        const response = await axios.post('https://thecaosieutoc.vn/chargingws/v2', {
+            command: 'charging',
+            partner_id: partnerId,
+            sign,
+            telco,
+            code: code.trim(),
+            serial: seri.trim(),
+            amount: denomination,
+            request_id: requestId
+        }, { timeout: 20000 });
+        const data = response.data || {};
+        const updated = readRechargeTransactions();
+        if (updated[requestId]) {
+            updated[requestId].provider_response_status = data.status ?? null;
+            updated[requestId].submitted_at = new Date().toISOString();
+            updated[requestId].status = ['99', 99, 'pending', 'success', '00'].includes(data.status) ? 'pending' : 'rejected';
+            writeRechargeTransactions(updated);
         }
+        if (['99', 99, 'pending', 'success', '00'].includes(data.status)) {
+            return res.json({ status: 'success', message: 'Đã gửi thẻ, đang chờ nhà cung cấp xử lý.', request_id: requestId });
+        }
+        return res.status(400).json({ status: 'error', message: data.message || data.msg || 'Nhà cung cấp chưa chấp nhận thẻ.' });
     } catch (error) {
-        res.status(500).json({ status: 'error', message: 'Lỗi kết nối gạch thẻ.' });
+        console.error('TheCaoSieuToc submit error:', error.response?.status || error.message);
+        const updated = readRechargeTransactions();
+        if (updated[requestId]) { updated[requestId].status = 'submission_unknown'; writeRechargeTransactions(updated); }
+        return res.status(502).json({ status: 'error', message: 'Chưa xác nhận được trạng thái gửi thẻ. Không gửi lại thẻ này; hãy kiểm tra giao dịch trước.' });
     }
 });
 
+// Provider callback configured as POST. Never grant points based only on callback-provided username/amount.
 app.post('/api/callback', async (req, res) => {
-    if (req.query.token !== process.env.CALLBACK_TOKEN) return res.status(403).send('Sai mã bảo mật');
-    const { status, request_id, amount } = req.body;
-    const username = request_id.split('_')[0];
+    const partnerKey = process.env.THECAOSIEUTOC_PARTNER_KEY;
+    if (!partnerKey) return res.status(503).send('Callback not configured');
 
-    if (status === 'success' || status === '1') {
-        try {
-            saveRechargeLocal(username, amount);
-            const gameAmount = parseInt(amount);
-            await executeMcCommand(`points give ${username} ${gameAmount}`);
-            await executeMcCommand(`broadcast §6§l[ ★ NẠP THẺ ★ ] §fNgười chơi §b${username} §fvừa nạp thành công §a${amount.toLocaleString()}đ §fvào hệ thống!`);
-            await executeMcCommand(`title ${username} title {"text":"§a§lTHANKS FOR DONATING!"}`);
-            await executeMcCommand(`title ${username} subtitle {"text":"§fBạn đã nhận được §e${gameAmount.toLocaleString()} points"}`);
-        } catch (err) {
-            console.error('Callback Error:', err);
-        }
+    const payload = req.body || {};
+    const { status, request_id, code, serial, callback_sign } = payload;
+    if (typeof request_id !== 'string' || typeof code !== 'string' || typeof serial !== 'string' || typeof callback_sign !== 'string') {
+        return res.status(400).send('Invalid callback');
     }
-    res.send('OK');
+    const expectedSign = crypto.createHash('md5').update(partnerKey + code + serial).digest('hex');
+    if (!safeEqualHex(callback_sign, expectedSign)) return res.status(403).send('Invalid signature');
+
+    const txs = readRechargeTransactions();
+    const tx = txs[request_id];
+    if (!tx) return res.status(404).send('Unknown transaction');
+    if (tx.status === 'credited' || tx.status === 'processing') return res.status(200).send('OK');
+
+    // Per provider docs, status 1 means successful; other statuses must never grant points.
+    if (!(status === 1 || status === '1')) {
+        tx.status = 'failed';
+        tx.provider_status = String(status);
+        tx.updated_at = new Date().toISOString();
+        txs[request_id] = tx;
+        writeRechargeTransactions(txs);
+        return res.status(200).send('OK');
+    }
+
+    // Credit using verified face value (value) when provided; fallback is not allowed.
+    const faceValue = positiveInteger(payload.value);
+    if (!faceValue || faceValue !== Number(tx.requested_value)) {
+        tx.status = 'manual_review';
+        tx.callback_value = payload.value ?? null;
+        tx.updated_at = new Date().toISOString();
+        txs[request_id] = tx;
+        writeRechargeTransactions(txs);
+        console.error('Recharge callback requires review:', request_id);
+        return res.status(200).send('OK');
+    }
+
+    tx.status = 'processing';
+    tx.callback_value = faceValue;
+    tx.updated_at = new Date().toISOString();
+    txs[request_id] = tx;
+    writeRechargeTransactions(txs);
+
+    try {
+        // Keep prior behavior: 1 point per VND of the verified face value.
+        await executeMcCommand(`points give ${tx.username} ${faceValue}`);
+        saveRechargeLocal(tx.username, faceValue);
+        await executeMcCommand(`broadcast §6§l[ ★ NẠP THẺ ★ ] §fNgười chơi §b${tx.username} §fvừa nạp thành công §a${faceValue.toLocaleString('vi-VN')}đ §fvào hệ thống!`);
+        await executeMcCommand(`title ${tx.username} title {"text":"§a§lTHANKS FOR DONATING!"}`);
+        await executeMcCommand(`title ${tx.username} subtitle {"text":"§fBạn đã nhận được §e${faceValue.toLocaleString('vi-VN')} points"}`);
+        const latest = readRechargeTransactions();
+        if (latest[request_id]) {
+            latest[request_id].status = 'credited';
+            latest[request_id].credited_at = new Date().toISOString();
+            writeRechargeTransactions(latest);
+        }
+        return res.status(200).send('OK');
+    } catch (err) {
+        console.error('Callback processing error:', err.message);
+        // Leave processing state for manual review to prevent duplicate credits.
+        return res.status(500).send('Processing error; manual review required');
+    }
 });
 
 // --- API PUBLIC ---
