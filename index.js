@@ -119,7 +119,10 @@ async function executeMcCommand(command) {
 // --- API AUTH ---
 
 app.post('/api/auth/register', async (req, res) => {
-    const { username, password } = req.body;
+    const { username, password } = req.body || {};
+    if (!validMinecraftUsername(username) || typeof password !== 'string' || password.length < 8 || password.length > 128) {
+        return res.status(400).json({ message: 'Tên tài khoản hoặc mật khẩu không hợp lệ (mật khẩu tối thiểu 8 ký tự).' });
+    }
     try {
         const [rows] = await pool.execute('SELECT id FROM authme WHERE username = ?', [username]);
         if (rows.length > 0) {
@@ -142,7 +145,10 @@ app.post('/api/auth/register', async (req, res) => {
 });
 
 app.post('/api/auth/login', async (req, res) => {
-    const { username, password } = req.body;
+    const { username, password } = req.body || {};
+    if (!validMinecraftUsername(username) || typeof password !== 'string' || password.length < 1 || password.length > 128) {
+        return res.status(400).json({ message: 'Thông tin đăng nhập không hợp lệ.' });
+    }
     try {
         const [rows] = await pool.execute('SELECT password, username FROM authme WHERE username = ?', [username]);
         if (rows.length === 0) {
@@ -217,8 +223,11 @@ function positiveInteger(value) {
     return Number.isSafeInteger(n) && n > 0 ? n : null;
 }
 
-app.post('/api/card-recharge', async (req, res) => {
+app.post('/api/card-recharge', authenticateToken, async (req, res) => {
     const { user, type, amount, code, seri } = req.body || {};
+    if (typeof user !== 'string' || user.toLowerCase() !== String(req.user.username).toLowerCase()) {
+        return res.status(403).json({ status: 'error', message: 'Bạn chỉ có thể nạp cho tài khoản đang đăng nhập.' });
+    }
     const partnerId = process.env.THECAOSIEUTOC_PARTNER_ID;
     const partnerKey = process.env.THECAOSIEUTOC_PARTNER_KEY;
     const telco = typeof type === 'string' ? type.trim().toUpperCase() : '';
@@ -344,6 +353,9 @@ app.post('/api/callback', async (req, res) => {
 
 app.get('/api/player/:username', async (req, res) => {
     const { username } = req.params;
+    if (!validMinecraftUsername(username)) {
+        return res.status(400).json({ status: 'error', message: 'Tên người chơi không hợp lệ.' });
+    }
     try {
         const data = JSON.parse(fs.readFileSync(DATABASE_FILE));
         const userData = data.find(item => item.username.toLowerCase() === username.toLowerCase());
@@ -361,15 +373,6 @@ app.get('/api/player/:username', async (req, res) => {
     }
 });
 
-app.get('/api/test-rcon', async (req, res) => {
-    try {
-        const response = await executeMcCommand('say RCON Test Connection Success!');
-        res.json({ status: 'success', server_response: response });
-    } catch (err) {
-        res.status(500).json({ status: 'error', message: err.message });
-    }
-});
-
 app.get('/api/top-recharge', (req, res) => {
     const data = JSON.parse(fs.readFileSync(DATABASE_FILE));
     res.json(data.slice(0, 10));
@@ -378,6 +381,21 @@ app.get('/api/top-recharge', (req, res) => {
 app.get('/api/recent-recharge', (req, res) => {
     const history = JSON.parse(fs.readFileSync(HISTORY_FILE));
     res.json(history.slice(0, 5));
+});
+
+// Health check: reports database availability without exposing connection details.
+app.get('/api/health', async (req, res) => {
+    try {
+        await pool.query('SELECT 1');
+        return res.json({ status: 'ok', database: 'connected' });
+    } catch (err) {
+        console.error('Database health check failed:', err.code || 'DB_ERROR');
+        return res.status(503).json({
+            status: 'degraded',
+            database: 'unavailable',
+            code: err.code || 'DB_ERROR'
+        });
+    }
 });
 
 app.listen(PORT, () => {
