@@ -226,6 +226,19 @@ app.get('/api/game/credits/:id', authenticateToken, async (req, res) => {
     }
 });
 
+// Plugin polls pending website requests so online administrators can be notified.
+app.get('/internal/commands/pending', requirePluginKey, async (req, res) => {
+    try {
+        const [rows] = await pool.execute(
+            "SELECT id, username, command_type AS type, amount, created_at AS createdAt FROM nightmare_game_commands WHERE status='pending' ORDER BY created_at ASC LIMIT 30"
+        );
+        return res.json({ status: 'success', requests: rows });
+    } catch (err) {
+        console.error('Pending game command poll failed:', err.code || 'DB_ERROR');
+        return res.status(503).json({ status: 'error', message: 'Pending request queue unavailable' });
+    }
+});
+
 // Only an administrator can approve a request after independently verifying payment/authorization.
 app.post('/internal/commands/:id/approve', requireAdminKey, async (req, res) => {
     try {
