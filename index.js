@@ -15,7 +15,7 @@ const crypto = require('crypto');
 
 const app = express();
 app.use(cors());
-app.use(bodyParser.json());
+app.use(bodyParser.json({ verify: (req, res, buffer) => { req.rawBody = Buffer.from(buffer); } }));
 app.use(bodyParser.urlencoded({ extended: true }));
 
 const PORT = process.env.PORT || 3000;
@@ -643,6 +643,11 @@ app.get('/api/health', async (req, res) => {
 });
 
 ensureSyncSchema().then(() => console.log('Minecraft sync schema ready')).catch(err => console.error('Minecraft sync schema unavailable:', err.code || 'DB_ERROR'));
+const { registerPayments } = require('./payments');
+registerPayments(app, pool, authenticateToken, executeMcCommand)
+    .then(() => console.log('Payment order schema ready'))
+    .catch(err => console.error('Payment order schema unavailable:', err.code || 'DB_ERROR'));
+
 
 app.listen(PORT, () => {
     console.log(`Backend server running on port ${PORT}`);
