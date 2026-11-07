@@ -35,6 +35,7 @@ const dbConfig = {
 
 const pool = mysql.createPool(dbConfig);
 const PLUGIN_SHARED_KEY = process.env.PLUGIN_SHARED_KEY || '';
+const ADMIN_SHARED_KEY = process.env.ADMIN_SHARED_KEY || '';
 
 async function ensureSyncSchema() {
     await pool.query(`CREATE TABLE IF NOT EXISTS nightmare_player_sync (
@@ -46,6 +47,21 @@ async function ensureSyncSchema() {
         synced_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
         INDEX idx_nightmare_sync_username (username)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS nightmare_game_commands (
+        id CHAR(36) PRIMARY KEY,
+        username VARCHAR(16) NOT NULL,
+        command_type ENUM('points','money') NOT NULL,
+        amount BIGINT UNSIGNED NOT NULL,
+        status ENUM('pending','approved','processing','completed','failed') NOT NULL DEFAULT 'pending',
+        result_message VARCHAR(255) NULL,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        claimed_at TIMESTAMP NULL,
+        completed_at TIMESTAMP NULL,
+        INDEX idx_nightmare_commands_user (username, created_at),
+        INDEX idx_nightmare_commands_status (status, created_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+    // Upgrade databases created by earlier plugin/backend builds.
+    await pool.query("ALTER TABLE nightmare_game_commands MODIFY status ENUM('pending','approved','processing','completed','failed') NOT NULL DEFAULT 'pending'");
 }
 
 function requirePluginKey(req, res, next) {
@@ -53,6 +69,15 @@ function requirePluginKey(req, res, next) {
     if (!PLUGIN_SHARED_KEY || supplied.length !== PLUGIN_SHARED_KEY.length ||
         !crypto.timingSafeEqual(Buffer.from(supplied), Buffer.from(PLUGIN_SHARED_KEY))) {
         return res.status(403).json({ status: 'error', message: 'Plugin authentication failed' });
+    }
+    next();
+}
+
+function requireAdminKey(req, res, next) {
+    const supplied = req.get('X-Admin-Key') || '';
+    if (!ADMIN_SHARED_KEY || supplied.length !== ADMIN_SHARED_KEY.length ||
+        !crypto.timingSafeEqual(Buffer.from(supplied), Buffer.from(ADMIN_SHARED_KEY))) {
+        return res.status(403).json({ status: 'error', message: 'Admin approval authentication failed' });
     }
     next();
 }
@@ -159,6 +184,92 @@ app.post('/internal/sync/player', requirePluginKey, async (req, res) => {
     } catch (err) {
         console.error('Minecraft sync failed:', err.code || 'DB_ERROR');
         return res.status(503).json({ status: 'error', message: 'Sync storage unavailable' });
+    }
+});
+
+// Website -> Minecraft: create a durable, owner-bound credit request.
+app.post('/api/game/credits', authenticateToken, async (req, res) => {
+    const username = req.user.username;
+    const type = String(req.body?.type || '').toLowerCase();
+    const amount = positiveInteger(req.body?.amount);
+    if (!['points', 'money'].includes(type) || !amount || amount > 1000000) {
+        return res.status(400).json({ status: 'error', message: 'Loại giao dịch hoặc số lượng không hợp lệ (tối đa 1.000.000).' });
+    }
+    try {
+        const [recent] = await pool.execute(
+            "SELECT COUNT(*) AS total FROM nightmare_game_commands WHERE LOWER(username)=LOWER(?) AND created_at >= NOW() - INTERVAL 1 HOUR",
+            [username]
+        );
+        if (Number(recent[0].total) >= 5) return res.status(429).json({ status: 'error', message: 'Bạn đã đạt giới hạn 5 yêu cầu mỗi giờ.' });
+        const id = crypto.randomUUID();
+        await pool.execute(
+            "INSERT INTO nightmare_game_commands (id, username, command_type, amount) VALUES (?, ?, ?, ?)",
+            [id, username, type, amount]
+        );
+        return res.status(201).json({ status: 'success', request: { id, username, type, amount, status: 'pending' } });
+    } catch (err) {
+        console.error('Game credit request failed:', err.code || 'DB_ERROR');
+        return res.status(503).json({ status: 'error', message: 'Không tạo được yêu cầu. Vui lòng thử lại sau.' });
+    }
+});
+
+app.get('/api/game/credits/:id', authenticateToken, async (req, res) => {
+    try {
+        const [rows] = await pool.execute(
+            'SELECT id, username, command_type AS type, amount, status, result_message AS message, created_at AS createdAt, completed_at AS completedAt FROM nightmare_game_commands WHERE id=? AND LOWER(username)=LOWER(?) LIMIT 1',
+            [req.params.id, req.user.username]
+        );
+        if (!rows.length) return res.status(404).json({ status: 'error', message: 'Không tìm thấy yêu cầu.' });
+        return res.json({ status: 'success', request: rows[0] });
+    } catch (err) {
+        return res.status(503).json({ status: 'error', message: 'Không đọc được trạng thái yêu cầu.' });
+    }
+});
+
+// Only an administrator can approve a request after independently verifying payment/authorization.
+app.post('/internal/commands/:id/approve', requireAdminKey, async (req, res) => {
+    try {
+        const [result] = await pool.execute("UPDATE nightmare_game_commands SET status='approved', result_message='Đã được quản trị viên duyệt.' WHERE id=? AND status='pending'", [req.params.id]);
+        if (!result.affectedRows) return res.status(409).json({ status: 'error', message: 'Yêu cầu không tồn tại hoặc không còn ở trạng thái chờ duyệt.' });
+        return res.json({ status: 'success', approved: true });
+    } catch (err) {
+        console.error('Game command approval failed:', err.code || 'DB_ERROR');
+        return res.status(503).json({ status: 'error', message: 'Không thể duyệt yêu cầu.' });
+    }
+});
+
+// A claimed request is never auto-replayed after a crash, preventing duplicate credits.
+app.post('/internal/commands/claim', requirePluginKey, async (req, res) => {
+    let conn;
+    try {
+        conn = await pool.getConnection();
+        await conn.beginTransaction();
+        const [rows] = await conn.query("SELECT id, username, command_type AS type, amount FROM nightmare_game_commands WHERE status='approved' ORDER BY created_at ASC LIMIT 1 FOR UPDATE");
+        if (!rows.length) { await conn.commit(); return res.json({ status: 'success', command: null }); }
+        const command = rows[0];
+        await conn.execute("UPDATE nightmare_game_commands SET status='processing', claimed_at=NOW() WHERE id=? AND status='approved'", [command.id]);
+        await conn.commit();
+        return res.json({ status: 'success', command });
+    } catch (err) {
+        if (conn) await conn.rollback();
+        console.error('Game command claim failed:', err.code || 'DB_ERROR');
+        return res.status(503).json({ status: 'error', message: 'Command queue unavailable' });
+    } finally { if (conn) conn.release(); }
+});
+
+app.post('/internal/commands/:id/complete', requirePluginKey, async (req, res) => {
+    const success = req.body?.success === true;
+    const message = typeof req.body?.message === 'string' ? req.body.message.slice(0, 240) : '';
+    try {
+        const [result] = await pool.execute(
+            "UPDATE nightmare_game_commands SET status=?, result_message=?, completed_at=NOW() WHERE id=? AND status='processing'",
+            [success ? 'completed' : 'failed', message || (success ? 'Đã cộng thành công.' : 'Server từ chối giao dịch.'), req.params.id]
+        );
+        if (!result.affectedRows) return res.status(409).json({ status: 'error', message: 'Request is not processing or was already finalized.' });
+        return res.json({ status: 'success', finalized: true });
+    } catch (err) {
+        console.error('Game command completion failed:', err.code || 'DB_ERROR');
+        return res.status(503).json({ status: 'error', message: 'Could not finalize command' });
     }
 });
 
