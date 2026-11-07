@@ -67,7 +67,7 @@ function validSePayWebhook(req) {
   const secret = process.env.SEPAY_WEBHOOK_SECRET || '';
   const timestamp = req.get('X-SePay-Timestamp') || '';
   const signature = req.get('X-SePay-Signature') || '';
-  if (!secret || !Buffer.isBuffer(req.rawBody) || !/^\\d{10}$/.test(timestamp)) return false;
+  if (!secret || !Buffer.isBuffer(req.rawBody) || !/^\d{10}$/.test(timestamp)) return false;
   if (Math.abs(Math.floor(Date.now() / 1000) - Number(timestamp)) > 300) return false;
   const expected = 'sha256=' + crypto.createHmac('sha256', secret)
     .update(timestamp + '.').update(req.rawBody).digest('hex');
@@ -76,7 +76,7 @@ function validSePayWebhook(req) {
 
 function extractPaymentCode(payload) {
   const text = [payload.code, payload.content, payload.description].filter(Boolean).join(' ').toUpperCase();
-  return (text.match(/\\bNTCYT[0-9A-F]{12}\\b/) || [])[0] || null;
+  return (text.match(/\bNTCYT[0-9A-F]{12}\b/) || [])[0] || null;
 }
 
 function registerPayments(app, pool, authenticateToken, executeMcCommand) {
@@ -188,13 +188,13 @@ function registerPayments(app, pool, authenticateToken, executeMcCommand) {
         [transactionId, amount, transferType, accountNumber || null]);
       if (!eventResult.affectedRows) {
         await conn.commit();
-        return res.status(200).json({ status: 'success', duplicate: true });
+        return res.status(200).json({ success: true, status: 'success', duplicate: true });
       }
 
       if (transferType !== 'in' || !expectedAccount || accountNumber !== expectedAccount || !paymentCode) {
         await conn.execute("UPDATE nightmare_payment_events SET status='ignored' WHERE transaction_id=?", [transactionId]);
         await conn.commit();
-        return res.status(200).json({ status: 'success', matched: false });
+        return res.status(200).json({ success: true, status: 'success', matched: false });
       }
 
       const [orders] = await conn.execute(`SELECT id,username,amount_vnd,total_points,status,(expires_at > NOW()) AS not_expired
@@ -202,19 +202,19 @@ function registerPayments(app, pool, authenticateToken, executeMcCommand) {
       if (!orders.length) {
         await conn.execute("UPDATE nightmare_payment_events SET status='unmatched' WHERE transaction_id=?", [transactionId]);
         await conn.commit();
-        return res.status(200).json({ status: 'success', matched: false });
+        return res.status(200).json({ success: true, status: 'success', matched: false });
       }
       const order = orders[0];
       if (Number(order.amount_vnd) !== amount) {
         await conn.execute("UPDATE nightmare_payment_events SET status='amount_mismatch',order_id=? WHERE transaction_id=?", [order.id, transactionId]);
         await conn.commit();
-        return res.status(200).json({ status: 'success', matched: false, reason: 'amount_mismatch' });
+        return res.status(200).json({ success: true, status: 'success', matched: false, reason: 'amount_mismatch' });
       }
       if (order.status !== 'pending' || Number(order.not_expired) !== 1) {
         if (order.status === 'pending') await conn.execute("UPDATE nightmare_payment_orders SET status='expired' WHERE id=? AND status='pending'", [order.id]);
         await conn.execute("UPDATE nightmare_payment_events SET status='order_not_pending',order_id=? WHERE transaction_id=?", [order.id, transactionId]);
         await conn.commit();
-        return res.status(200).json({ status: 'success', matched: false });
+        return res.status(200).json({ success: true, status: 'success', matched: false });
       }
 
       const [paid] = await conn.execute(`UPDATE nightmare_payment_orders SET status='paid',paid_at=NOW()
@@ -228,7 +228,7 @@ function registerPayments(app, pool, authenticateToken, executeMcCommand) {
         await conn.execute("UPDATE nightmare_payment_events SET status='paid',order_id=? WHERE transaction_id=?", [order.id, transactionId]);
       }
       await conn.commit();
-      return res.status(200).json({ status: 'success', matched: Boolean(paid.affectedRows) });
+      return res.status(200).json({ success: true, status: 'success', matched: Boolean(paid.affectedRows) });
     } catch (err) {
       if (conn) await conn.rollback();
       console.error('SePay webhook processing failed:', err.code || 'DB_ERROR');
