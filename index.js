@@ -34,6 +34,28 @@ const dbConfig = {
 };
 
 const pool = mysql.createPool(dbConfig);
+const PLUGIN_SHARED_KEY = process.env.PLUGIN_SHARED_KEY || '';
+
+async function ensureSyncSchema() {
+    await pool.query(`CREATE TABLE IF NOT EXISTS nightmare_player_sync (
+        minecraft_uuid VARCHAR(36) PRIMARY KEY,
+        username VARCHAR(16) NOT NULL,
+        rank_name VARCHAR(64) NOT NULL,
+        points BIGINT UNSIGNED NOT NULL DEFAULT 0,
+        balance DECIMAL(20,2) NOT NULL DEFAULT 0,
+        synced_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX idx_nightmare_sync_username (username)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+}
+
+function requirePluginKey(req, res, next) {
+    const supplied = req.get('X-Plugin-Key') || '';
+    if (!PLUGIN_SHARED_KEY || supplied.length !== PLUGIN_SHARED_KEY.length ||
+        !crypto.timingSafeEqual(Buffer.from(supplied), Buffer.from(PLUGIN_SHARED_KEY))) {
+        return res.status(403).json({ status: 'error', message: 'Plugin authentication failed' });
+    }
+    next();
+}
 
 // Helper check password AuthMe ($SHA$salt$hash)
 function verifyAuthMePassword(password, storedHash) {
@@ -116,6 +138,30 @@ async function executeMcCommand(command) {
     }
 }
 
+// Minecraft plugin -> backend: authoritative snapshot from LuckPerms, PlayerPoints and Vault.
+app.post('/internal/sync/player', requirePluginKey, async (req, res) => {
+    const { uuid, username, rank, points, balance } = req.body || {};
+    if (!/^[0-9a-f-]{36}$/i.test(String(uuid || '')) || !validMinecraftUsername(username) ||
+        typeof rank !== 'string' || rank.length < 1 || rank.length > 64 ||
+        !Number.isSafeInteger(Number(points)) || Number(points) < 0 ||
+        !Number.isFinite(Number(balance)) || Number(balance) < 0) {
+        return res.status(400).json({ status: 'error', message: 'Invalid player snapshot' });
+    }
+    try {
+        await ensureSyncSchema();
+        await pool.execute(`INSERT INTO nightmare_player_sync
+            (minecraft_uuid, username, rank_name, points, balance)
+            VALUES (?, ?, ?, ?, ?)
+            ON DUPLICATE KEY UPDATE username=VALUES(username), rank_name=VALUES(rank_name),
+            points=VALUES(points), balance=VALUES(balance), synced_at=CURRENT_TIMESTAMP`,
+            [String(uuid).toLowerCase(), username, rank, String(points), String(balance)]);
+        return res.json({ status: 'success', synced: true });
+    } catch (err) {
+        console.error('Minecraft sync failed:', err.code || 'DB_ERROR');
+        return res.status(503).json({ status: 'error', message: 'Sync storage unavailable' });
+    }
+});
+
 // --- API AUTH ---
 
 app.post('/api/auth/register', async (req, res) => {
@@ -171,24 +217,26 @@ app.post('/api/auth/login', async (req, res) => {
 app.get('/api/auth/me', authenticateToken, async (req, res) => {
     const username = req.user.username;
     try {
-        const data = JSON.parse(fs.readFileSync(DATABASE_FILE));
-        const userData = data.find(item => item.username.toLowerCase() === username.toLowerCase());
-        const totalRecharge = userData ? userData.total : 0;
-
-        const pointsRes = await executeMcCommand(`points look ${username}`);
-        const pointsMatch = pointsRes.match(/has ([\d,.]+) points/);
-        const points = pointsMatch ? pointsMatch[1] : "0";
-
-        const rankRes = await executeMcCommand(`lp user ${username} info`);
-        const rankMatch = rankRes.match(/Primary group: ([\w-]+)/);
-        const rank = rankMatch ? rankMatch[1] : "Default";
-
-        res.json({
-            status: 'success',
-            user: { username, points, rank, totalRecharge }
-        });
+        await ensureSyncSchema();
+        const [rows] = await pool.execute(
+            'SELECT username, rank_name, points, balance, synced_at FROM nightmare_player_sync WHERE LOWER(username)=LOWER(?) ORDER BY synced_at DESC LIMIT 1',
+            [username]
+        );
+        const data = JSON.parse(fs.readFileSync(DATABASE_FILE, 'utf8'));
+        const recharge = data.find(item => item.username.toLowerCase() === username.toLowerCase());
+        const snapshot = rows[0];
+        return res.json({ status: 'success', user: {
+            username,
+            rank: snapshot ? snapshot.rank_name : null,
+            points: snapshot ? String(snapshot.points) : null,
+            balance: snapshot ? Number(snapshot.balance) : null,
+            syncedAt: snapshot ? snapshot.synced_at : null,
+            totalRecharge: recharge ? recharge.total : 0,
+            gameConnected: Boolean(snapshot)
+        }});
     } catch (err) {
-        res.json({ status: 'success', user: { username, points: '?', rank: '?', totalRecharge: 0 } });
+        console.error('Profile sync read failed:', err.code || 'DB_ERROR');
+        return res.status(503).json({ status: 'error', message: 'Không đọc được dữ liệu máy chủ game.' });
     }
 });
 
@@ -353,23 +401,42 @@ app.post('/api/callback', async (req, res) => {
 
 app.get('/api/player/:username', async (req, res) => {
     const { username } = req.params;
-    if (!validMinecraftUsername(username)) {
-        return res.status(400).json({ status: 'error', message: 'Tên người chơi không hợp lệ.' });
-    }
+    if (!validMinecraftUsername(username)) return res.status(400).json({ status: 'error', message: 'Tên người chơi không hợp lệ.' });
     try {
-        const data = JSON.parse(fs.readFileSync(DATABASE_FILE));
-        const userData = data.find(item => item.username.toLowerCase() === username.toLowerCase());
-        const totalRecharge = userData ? userData.total : 0;
-        const pointsRes = await executeMcCommand(`points look ${username}`);
-        const pointsMatch = pointsRes.match(/has ([\d,.]+) points/);
-        const points = pointsMatch ? pointsMatch[1] : "0";
-        const rankRes = await executeMcCommand(`lp user ${username} info`);
-        const rankMatch = rankRes.match(/Primary group: ([\w-]+)/);
-        const rank = rankMatch ? rankMatch[1] : "Default";
-
-        res.json({ status: 'success', data: { username, points, rank, totalRecharge } });
+        await ensureSyncSchema();
+        const [rows] = await pool.execute(
+            'SELECT username, rank_name, points, balance, synced_at FROM nightmare_player_sync WHERE LOWER(username)=LOWER(?) ORDER BY synced_at DESC LIMIT 1',
+            [username]
+        );
+        const data = JSON.parse(fs.readFileSync(DATABASE_FILE, 'utf8'));
+        const recharge = data.find(item => item.username.toLowerCase() === username.toLowerCase());
+        const snapshot = rows[0];
+        return res.json({ status: 'success', data: {
+            username, rank: snapshot?.rank_name ?? null,
+            points: snapshot ? String(snapshot.points) : null,
+            balance: snapshot ? Number(snapshot.balance) : null,
+            syncedAt: snapshot?.synced_at ?? null,
+            gameConnected: Boolean(snapshot), totalRecharge: recharge?.total ?? 0
+        }});
     } catch (err) {
-        res.status(500).json({ status: 'error', message: 'Lỗi tra cứu.' });
+        console.error('Player lookup failed:', err.code || 'DB_ERROR');
+        return res.status(503).json({ status: 'error', message: 'Dữ liệu game hiện chưa khả dụng.' });
+    }
+});
+
+app.get('/api/top-players', async (req, res) => {
+    const sort = ['points', 'balance'].includes(String(req.query.sort || '').toLowerCase())
+        ? String(req.query.sort).toLowerCase() : 'points';
+    try {
+        await ensureSyncSchema();
+        const [rows] = await pool.query(`SELECT username, rank_name AS rank, points, balance, synced_at AS syncedAt
+            FROM nightmare_player_sync ORDER BY ${sort} DESC, synced_at DESC LIMIT 50`);
+        return res.json({ status: 'success', players: rows.map(row => ({
+            ...row, points: String(row.points), balance: Number(row.balance)
+        })) });
+    } catch (err) {
+        console.error('Leaderboard read failed:', err.code || 'DB_ERROR');
+        return res.status(503).json({ status: 'error', message: 'Bảng xếp hạng game chưa khả dụng.' });
     }
 });
 
@@ -397,6 +464,8 @@ app.get('/api/health', async (req, res) => {
         });
     }
 });
+
+ensureSyncSchema().then(() => console.log('Minecraft sync schema ready')).catch(err => console.error('Minecraft sync schema unavailable:', err.code || 'DB_ERROR'));
 
 app.listen(PORT, () => {
     console.log(`Backend server running on port ${PORT}`);
