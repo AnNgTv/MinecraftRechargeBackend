@@ -417,12 +417,27 @@ app.get('/api/auth/me', authenticateToken, async (req, res) => {
     }
 });
 
-// Lấy lịch sử nạp cá nhân
-app.get('/api/auth/transactions', authenticateToken, (req, res) => {
-    const username = req.user.username;
-    const history = JSON.parse(fs.readFileSync(HISTORY_FILE));
-    const userHistory = history.filter(h => h.username.toLowerCase() === username.toLowerCase());
-    res.json({ status: 'success', transactions: userHistory });
+// Lịch sử giao dịch: nạp xu và ủng hộ, lấy từ đơn thanh toán đã lưu trong MySQL.
+app.get('/api/auth/transactions', authenticateToken, async (req, res) => {
+    try {
+        const [rows] = await pool.execute(`SELECT o.id, o.transaction_type AS type, o.amount_vnd AS amount,
+            o.total_points AS points, o.status, o.created_at AS date, o.paid_at AS paidAt,
+            c.status AS commandStatus
+            FROM nightmare_payment_orders o
+            LEFT JOIN nightmare_game_commands c ON c.id=o.id
+            WHERE LOWER(o.username)=LOWER(?)
+            ORDER BY o.created_at DESC LIMIT 100`, [req.user.username]);
+        const transactions = rows.map(row => ({
+            id: row.id, type: row.type, amount: Number(row.amount), points: Number(row.points),
+            status: row.commandStatus === 'completed' ? 'fulfilled' :
+                row.commandStatus === 'failed' ? 'needs_review' : row.status,
+            date: row.date, paidAt: row.paidAt
+        }));
+        return res.json({ status: 'success', transactions });
+    } catch (err) {
+        console.error('Payment history read failed:', err.code || 'DB_ERROR');
+        return res.status(503).json({ status: 'error', message: 'Không đọc được lịch sử giao dịch.' });
+    }
 });
 
 // --- API RECHARGE ---
@@ -617,11 +632,35 @@ app.get('/api/top-players', async (req, res) => {
     }
 });
 
-app.get('/api/top-recharge', (req, res) => {
-    const data = JSON.parse(fs.readFileSync(DATABASE_FILE));
-    res.json(data.slice(0, 10));
-});
+// Hai bảng vinh danh độc lập, chỉ tính đơn đã được plugin xác nhận cấp xu thành công.
+function paymentPeriodSql(period) {
+    if (period === 'week') return ' AND o.created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)';
+    if (period === 'month') return ' AND o.created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)';
+    return '';
+}
+async function readPaymentLeaderboard(req, res, transactionType) {
+    const period = ['week', 'month', 'all'].includes(String(req.query.period || '').toLowerCase())
+        ? String(req.query.period).toLowerCase() : 'all';
+    try {
+        const [rows] = await pool.execute(`SELECT MIN(o.username) AS username,
+            SUM(o.amount_vnd) AS total, COUNT(*) AS transactions
+            FROM nightmare_payment_orders o
+            INNER JOIN nightmare_game_commands c ON c.id=o.id AND c.status='completed'
+            WHERE o.transaction_type=?${paymentPeriodSql(period)}
+            GROUP BY LOWER(o.username)
+            ORDER BY total DESC, username ASC LIMIT 20`, [transactionType]);
+        return res.json({ status: 'success', period, data: rows.map(row => ({
+            username: row.username, total: Number(row.total), transactions: Number(row.transactions)
+        })) });
+    } catch (err) {
+        console.error('Payment leaderboard read failed:', err.code || 'DB_ERROR');
+        return res.status(503).json({ status: 'error', message: 'Bảng xếp hạng thanh toán chưa khả dụng.' });
+    }
+}
+app.get('/api/top-recharge', (req, res) => readPaymentLeaderboard(req, res, 'recharge'));
+app.get('/api/top-donation', (req, res) => readPaymentLeaderboard(req, res, 'donation'));
 
+// Giữ API cũ để không làm hỏng những trang cũ chưa chuyển đổi.
 app.get('/api/recent-recharge', (req, res) => {
     const history = JSON.parse(fs.readFileSync(HISTORY_FILE));
     res.json(history.slice(0, 5));
