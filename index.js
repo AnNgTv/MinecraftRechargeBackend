@@ -36,6 +36,7 @@ const dbConfig = {
 const pool = mysql.createPool(dbConfig);
 const PLUGIN_SHARED_KEY = process.env.PLUGIN_SHARED_KEY || '';
 const ADMIN_SHARED_KEY = process.env.ADMIN_SHARED_KEY || '';
+const DISCORD_BOT_SHARED_KEY = process.env.DISCORD_BOT_SHARED_KEY || '';
 
 async function ensureSyncSchema() {
     await pool.query(`CREATE TABLE IF NOT EXISTS nightmare_player_sync (
@@ -52,16 +53,25 @@ async function ensureSyncSchema() {
         username VARCHAR(16) NOT NULL,
         command_type ENUM('points','money') NOT NULL,
         amount BIGINT UNSIGNED NOT NULL,
-        status ENUM('pending','approved','processing','completed','failed') NOT NULL DEFAULT 'pending',
+        status ENUM('pending','approved','rejected','processing','completed','failed') NOT NULL DEFAULT 'pending',
         result_message VARCHAR(255) NULL,
         created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
         claimed_at TIMESTAMP NULL,
         completed_at TIMESTAMP NULL,
+        reviewed_by VARCHAR(64) NULL,
+        reviewed_at TIMESTAMP NULL,
         INDEX idx_nightmare_commands_user (username, created_at),
         INDEX idx_nightmare_commands_status (status, created_at)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
     // Upgrade databases created by earlier plugin/backend builds.
-    await pool.query("ALTER TABLE nightmare_game_commands MODIFY status ENUM('pending','approved','processing','completed','failed') NOT NULL DEFAULT 'pending'");
+    await pool.query("ALTER TABLE nightmare_game_commands MODIFY status ENUM('pending','approved','rejected','processing','completed','failed') NOT NULL DEFAULT 'pending'");
+    for (const column of [
+        ['reviewed_by', 'VARCHAR(64) NULL'],
+        ['reviewed_at', 'TIMESTAMP NULL']
+    ]) {
+        try { await pool.query(`ALTER TABLE nightmare_game_commands ADD COLUMN ${column[0]} ${column[1]}`); }
+        catch (err) { if (err.code !== 'ER_DUP_FIELDNAME') throw err; }
+    }
 }
 
 function requirePluginKey(req, res, next) {
@@ -78,6 +88,15 @@ function requireAdminKey(req, res, next) {
     if (!ADMIN_SHARED_KEY || supplied.length !== ADMIN_SHARED_KEY.length ||
         !crypto.timingSafeEqual(Buffer.from(supplied), Buffer.from(ADMIN_SHARED_KEY))) {
         return res.status(403).json({ status: 'error', message: 'Admin approval authentication failed' });
+    }
+    next();
+}
+
+function requireDiscordKey(req, res, next) {
+    const supplied = req.get('X-Discord-Key') || '';
+    if (!DISCORD_BOT_SHARED_KEY || supplied.length !== DISCORD_BOT_SHARED_KEY.length ||
+        !crypto.timingSafeEqual(Buffer.from(supplied), Buffer.from(DISCORD_BOT_SHARED_KEY))) {
+        return res.status(403).json({ status: 'error', message: 'Discord bot authentication failed' });
     }
     next();
 }
@@ -248,6 +267,40 @@ app.post('/internal/commands/:id/approve', requireAdminKey, async (req, res) => 
     } catch (err) {
         console.error('Game command approval failed:', err.code || 'DB_ERROR');
         return res.status(503).json({ status: 'error', message: 'Không thể duyệt yêu cầu.' });
+    }
+});
+
+// Discord bot: fetch pending requests and record an auditable approve/reject decision.
+app.get('/internal/discord/credits/pending', requireDiscordKey, async (req, res) => {
+    try {
+        const [rows] = await pool.execute(
+            "SELECT id, username, command_type AS type, amount, created_at AS createdAt FROM nightmare_game_commands WHERE status='pending' ORDER BY created_at ASC LIMIT 50"
+        );
+        return res.json({ status: 'success', requests: rows });
+    } catch (err) {
+        console.error('Discord credit queue failed:', err.code || 'DB_ERROR');
+        return res.status(503).json({ status: 'error', message: 'Credit review queue unavailable' });
+    }
+});
+
+app.post('/internal/discord/credits/:id/decision', requireDiscordKey, async (req, res) => {
+    const decision = String(req.body?.decision || '').toLowerCase();
+    const moderatorId = String(req.body?.moderatorId || '').trim();
+    if (!['approve', 'reject'].includes(decision) || !/^\d{17,20}$/.test(moderatorId)) {
+        return res.status(400).json({ status: 'error', message: 'Invalid decision or moderator ID.' });
+    }
+    const status = decision === 'approve' ? 'approved' : 'rejected';
+    const message = decision === 'approve' ? 'Đã được duyệt qua Discord.' : 'Đã bị từ chối qua Discord.';
+    try {
+        const [result] = await pool.execute(
+            "UPDATE nightmare_game_commands SET status=?, result_message=?, reviewed_by=?, reviewed_at=NOW() WHERE id=? AND status='pending'",
+            [status, message, moderatorId, req.params.id]
+        );
+        if (!result.affectedRows) return res.status(409).json({ status: 'error', message: 'Yêu cầu không tồn tại hoặc đã được xử lý.' });
+        return res.json({ status: 'success', decision: status, reviewedBy: moderatorId });
+    } catch (err) {
+        console.error('Discord credit decision failed:', err.code || 'DB_ERROR');
+        return res.status(503).json({ status: 'error', message: 'Could not save the decision.' });
     }
 });
 
