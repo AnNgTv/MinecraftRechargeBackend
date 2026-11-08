@@ -420,6 +420,13 @@ app.get('/api/auth/me', authenticateToken, async (req, res) => {
 // Lịch sử giao dịch: nạp xu và ủng hộ, lấy từ đơn thanh toán đã lưu trong MySQL.
 app.get('/api/auth/transactions', authenticateToken, async (req, res) => {
     try {
+        // Mark this user's unpaid orders as expired after the 30-minute payment window.
+        // This updates history only; it does not credit points or change paid orders.
+        await pool.execute(`UPDATE nightmare_payment_orders
+            SET status='expired'
+            WHERE LOWER(username)=LOWER(?) AND status='pending' AND expires_at<=NOW()`,
+            [req.user.username]);
+
         const [rows] = await pool.execute(`SELECT o.id, o.transaction_type AS type, o.amount_vnd AS amount,
             o.total_points AS points, o.status, o.created_at AS date, o.paid_at AS paidAt,
             c.status AS commandStatus
